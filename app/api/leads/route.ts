@@ -3,10 +3,11 @@ import { NextRequest, NextResponse } from "next/server";
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID!;
-const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN!;
-const WA_FROM      = process.env.TWILIO_WHATSAPP_FROM!; // whatsapp:+15559730487
+const TWILIO_SECRET= process.env.TWILIO_API_SECRET!;   // ← API Secret (not auth token)
+const WA_FROM      = process.env.TWILIO_WHATSAPP_FROM!;
 const HUBSPOT_TOKEN= process.env.HUBSPOT_API_TOKEN!;
 
+// ── Supabase ──────────────────────────────────────────────────────────────────
 async function saveLead(data: any) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/pep_leads`, {
     method: "POST",
@@ -17,67 +18,85 @@ async function saveLead(data: any) {
       "Prefer": "return=representation",
     },
     body: JSON.stringify({
-      full_name: data.name,
-      email: data.email,
-      phone: data.phone,
-      address: data.address || "",
-      square_footage: data.sqft || null,
-      project_type: data.floorType || data.floor || "garage",
-      desired_finish: data.system || "TBD",
+      full_name:          data.name,
+      email:              data.email,
+      phone:              data.phone,
+      address:            data.address || "",
+      square_footage:     data.sqft ? parseInt(data.sqft) : null,
+      project_type:       data.floorType || data.floor || "garage",
+      desired_finish:     data.system || "TBD",
       preferred_timeline: data.timeline || "flexible",
-      notes: data.notes || "",
-      source_page: data.source || "web",
-      whatsapp_number: data.phone,
-      whatsapp_consent: true,
-      status: "new",
-      ai_score: 75,
-      lead_score: 75,
+      notes:              data.notes || "",
+      source_page:        data.source || "web",
+      whatsapp_number:    data.phone,
+      whatsapp_consent:   true,
+      status:             "new",
+      ai_score:           80,
+      lead_score:         80,
     }),
   });
-  if (!res.ok) throw new Error(`Supabase error: ${res.status}`);
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Supabase ${res.status}: ${txt.slice(0, 120)}`);
+  }
   const rows = await res.json();
-  return rows[0];
+  return rows[0] || {};
 }
 
-async function sendWhatsApp(lead: any) {
-  const msg = `🔥 NEW LEAD — Epoxy Nation Pro\n\n👤 ${lead.full_name}\n📱 ${lead.phone}\n📧 ${lead.email}\n🏠 ${lead.project_type || "Garage"}\n📐 ${lead.square_footage || "TBD"} sqft\n⏱ ${lead.preferred_timeline || "flexible"}\n\n💬 Reply to claim this lead`;
-  const params = new URLSearchParams({
-    From: WA_FROM,
-    To: `whatsapp:+15559730487`,
-    Body: msg,
-  });
-  const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Authorization": `Basic ${Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString("base64")}`,
-    },
-    body: params.toString(),
-  });
-  const result = await res.json();
-  return result.sid || result.message;
+// ── Twilio WhatsApp ───────────────────────────────────────────────────────────
+async function sendWA(to: string, body: string) {
+  const params = new URLSearchParams({ From: WA_FROM, To: to, Body: body });
+  const authHeader = `Basic ${Buffer.from(`${TWILIO_SID}:${TWILIO_SECRET}`).toString("base64")}`;
+  const res = await fetch(
+    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", "Authorization": authHeader },
+      body: params.toString(),
+    }
+  );
+  const json = await res.json();
+  if (json.status >= 400) throw new Error(json.message || "Twilio error");
+  return json.sid as string;
 }
 
-async function confirmToLead(phone: string, name: string) {
-  const firstName = name.split(" ")[0];
-  const msg = `Hey ${firstName}! 👋 This is Epoxy Nation Pro — Powered by Xtreme Polishing Systems.\n\nWe received your bid request and our estimator will review your project within the next 24 hours.\n\n✅ You get 15% OFF for using our digital bid system.\n\nReply to this message with any questions or photos of your floor. Talk soon! 🏗️`;
-  const params = new URLSearchParams({
-    From: WA_FROM,
-    To: `whatsapp:${phone}`,
-    Body: msg,
-  });
-  const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Authorization": `Basic ${Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString("base64")}`,
-    },
-    body: params.toString(),
-  });
-  return (await res.json()).sid;
+async function notifyOps(lead: any) {
+  const msg = [
+    `🔥 NEW LEAD — Epoxy Nation Pro`,
+    ``,
+    `👤 ${lead.full_name}`,
+    `📱 ${lead.phone}`,
+    `📧 ${lead.email}`,
+    `🏠 ${lead.project_type || "Garage"} | ${lead.square_footage || "??"} sqft`,
+    `🎨 ${lead.desired_finish || "TBD"}`,
+    `⏱ ${lead.preferred_timeline || "flexible"}`,
+    `💰 Score: ${lead.lead_score || 80}/100`,
+    ``,
+    `📋 Lead ID: ${lead.id?.slice(0, 8) || "new"}`,
+    `Reply to claim →`,
+  ].join("\n");
+  return sendWA(`whatsapp:+15559730487`, msg);
 }
 
-async function syncHubSpot(lead: any) {
+async function confirmLead(phone: string, name: string) {
+  const first = name.split(" ")[0];
+  const msg = [
+    `Hey ${first}! 👋`,
+    ``,
+    `This is Epoxy Nation Pro — Powered by Xtreme Polishing Systems.`,
+    ``,
+    `✅ We got your bid request! Our estimator will review within 24 hours.`,
+    ``,
+    `🎁 You qualify for 15% OFF for using our digital bid system.`,
+    ``,
+    `Send photos of your floor here and we'll get you an even faster quote!`,
+  ].join("\n");
+  return sendWA(`whatsapp:${phone}`, msg);
+}
+
+// ── HubSpot ───────────────────────────────────────────────────────────────────
+async function syncHubSpot(data: any) {
+  const [first, ...rest] = (data.name || "").split(" ");
   const res = await fetch("https://api.hubapi.com/crm/v3/objects/contacts", {
     method: "POST",
     headers: {
@@ -86,55 +105,56 @@ async function syncHubSpot(lead: any) {
     },
     body: JSON.stringify({
       properties: {
-        firstname: lead.full_name?.split(" ")[0] || lead.full_name,
-        lastname: lead.full_name?.split(" ").slice(1).join(" ") || "",
-        email: lead.email,
-        phone: lead.phone,
+        firstname: first,
+        lastname: rest.join(" "),
+        email: data.email,
+        phone: data.phone,
         hs_lead_status: "NEW",
         lifecyclestage: "lead",
-        lead_source: "Epoxy Nation Pro — Digital Bid",
+        jobtitle: `Epoxy Lead — ${data.floorType || "Garage"} — Phoenix`,
       },
     }),
   });
-  const result = await res.json();
-  return result.id || result.message;
+  const json = await res.json();
+  return json.id || json.message?.slice(0, 80);
 }
 
+// ── Route Handler ─────────────────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    console.log("[ENP Lead]", body.name, body.source);
+  let body: any = {};
+  try { body = await req.json(); } catch { return NextResponse.json({ success: false, error: "Invalid JSON" }, { status: 400 }); }
 
-    // 1. Save to Supabase pep_leads
-    let savedLead: any = {};
-    try { savedLead = await saveLead(body); } catch (e) { console.error("Supabase:", e); }
+  console.log("[ENP Lead]", body.name, body.source);
 
-    // 2. Fire Twilio WA to ops (Jeremy)
-    let waSid = "";
-    try { waSid = await sendWhatsApp({ ...body, ...savedLead }); } catch (e) { console.error("Twilio ops:", e); }
+  const results: Record<string, any> = {};
 
-    // 3. Confirm to lead via WhatsApp
-    if (body.phone) {
-      try { await confirmToLead(body.phone, body.name || "there"); } catch (e) { console.error("Twilio confirm:", e); }
-    }
+  // 1. Supabase
+  let savedLead: any = {};
+  try { savedLead = await saveLead(body); results.supabase = "ok"; }
+  catch (e: any) { results.supabase = `err: ${e.message?.slice(0, 60)}`; console.error("Supabase:", e); }
 
-    // 4. HubSpot sync
-    let hsId = "";
-    try { hsId = await syncHubSpot({ ...body, ...savedLead }); } catch (e) { console.error("HubSpot:", e); }
+  // 2. Notify ops via WhatsApp
+  try { results.wa_ops = await notifyOps({ ...body, ...savedLead }); }
+  catch (e: any) { results.wa_ops = `err: ${e.message?.slice(0, 60)}`; console.error("WA ops:", e); }
 
-    return NextResponse.json({
-      success: true,
-      lead_id: savedLead?.id,
-      wa_sid: waSid,
-      hs_id: hsId,
-      message: "Lead saved. WhatsApp sent. HubSpot synced.",
-    });
-  } catch (err: any) {
-    console.error("[ENP Lead] Fatal:", err);
-    return NextResponse.json({ success: false, error: err.message }, { status: 500 });
+  // 3. Confirm to lead
+  if (body.phone) {
+    try { results.wa_lead = await confirmLead(body.phone, body.name || "there"); }
+    catch (e: any) { results.wa_lead = `err: ${e.message?.slice(0, 60)}`; console.error("WA lead:", e); }
   }
+
+  // 4. HubSpot
+  try { results.hubspot = await syncHubSpot(body); }
+  catch (e: any) { results.hubspot = `err: ${e.message?.slice(0, 60)}`; console.error("HubSpot:", e); }
+
+  return NextResponse.json({
+    success: !!savedLead.id,
+    lead_id: savedLead?.id,
+    results,
+    message: "Lead processed.",
+  });
 }
 
 export async function GET() {
-  return NextResponse.json({ status: "Epoxy Nation Pro Lead API v2 — Live" });
+  return NextResponse.json({ status: "Epoxy Nation Pro Lead API v2.1 — Live" });
 }
